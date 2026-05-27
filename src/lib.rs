@@ -30,7 +30,8 @@
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::items_after_statements,
-    clippy::too_many_lines,    // process_line is a sequential decision tree — splitting adds no clarity
+    clippy::too_many_lines,
+    clippy::too_many_arguments
 )]
 
 use std::collections::HashMap;
@@ -81,8 +82,9 @@ struct FaiEntry {
     line_width: u64,
 }
 
-/// Load a .fai index into a name → entry map.
-fn load_fai(fai_path: &Path) -> Result<HashMap<String, FaiEntry>> {
+/// Load a .fai index into a name → entry map (keys as `Vec<u8>` for zero-copy
+/// lookup against the VCF CHROM field without UTF-8 conversion).
+fn load_fai(fai_path: &Path) -> Result<HashMap<Vec<u8>, FaiEntry>> {
     let reader = BufReader::new(
         File::open(fai_path)
             .map_err(|e| RsomicsError::InvalidInput(format!("{}: {e}", fai_path.display())))?,
@@ -99,17 +101,17 @@ fn load_fai(fai_path: &Path) -> Result<HashMap<String, FaiEntry>> {
                 "malformed .fai line: {line}"
             )));
         }
-        let parse_u64 = |s: &str| {
+        let parse_u64_str = |s: &str| {
             s.parse::<u64>()
                 .map_err(|e| RsomicsError::InvalidInput(format!("bad .fai field '{s}': {e}")))
         };
         map.insert(
-            cols[0].to_owned(),
+            cols[0].as_bytes().to_vec(),
             FaiEntry {
-                length: parse_u64(cols[1])?,
-                offset: parse_u64(cols[2])?,
-                line_bases: parse_u64(cols[3])?,
-                line_width: parse_u64(cols[4])?,
+                length: parse_u64_str(cols[1])?,
+                offset: parse_u64_str(cols[2])?,
+                line_bases: parse_u64_str(cols[3])?,
+                line_width: parse_u64_str(cols[4])?,
             },
         );
     }
@@ -122,13 +124,9 @@ fn load_fai(fai_path: &Path) -> Result<HashMap<String, FaiEntry>> {
 /// the 0-based position. Loading once per contig eliminates per-record seek
 /// syscalls — the dominant cost for chromosome-sorted VCF inputs.
 fn load_contig(fasta: &mut File, entry: &FaiEntry) -> Option<Arc<Vec<u8>>> {
-    // FASTA stores `line_bases` bases per line, then `line_width - line_bases`
-    // bytes of newline padding.  To load the whole contig we seek to the first
-    // base and read enough raw bytes to cover all lines, then strip newlines.
     let newline_bytes = entry.line_width - entry.line_bases;
     let full_lines = entry.length / entry.line_bases;
     let remainder = entry.length % entry.line_bases;
-    // Total raw bytes on disk (bases + newlines), including the partial last line.
     let raw_len = full_lines * entry.line_width
         + if remainder > 0 {
             remainder + newline_bytes
@@ -140,21 +138,17 @@ fn load_contig(fasta: &mut File, entry: &FaiEntry) -> Option<Arc<Vec<u8>>> {
     let mut raw = vec![0u8; raw_len as usize];
     fasta.read_exact(&mut raw).ok()?;
 
-    // Strip newline characters; pre-allocate for exact length.
     let mut bases = Vec::with_capacity(entry.length as usize);
     for b in raw {
         if b != b'\n' && b != b'\r' {
             bases.push(b);
         }
     }
-    // Truncate to declared length in case the last line had trailing whitespace.
     bases.truncate(entry.length as usize);
     Some(Arc::new(bases))
 }
 
 /// Look up a single base (0-based position) from a cached contig buffer.
-///
-/// Returns `None` if the position is out of range or the base is not ACGT.
 #[inline]
 fn base_from_cache(contig: &[u8], pos0: u64) -> Option<u8> {
     let b = *contig.get(pos0 as usize)?;
@@ -206,166 +200,225 @@ struct Stats {
     count: [[u64; 4]; 4],
 }
 
-// ── VCF record processing ─────────────────────────────────────────────────────
+// ── Tab-split helpers ─────────────────────────────────────────────────────────
 
-/// Swap 0↔1 allele indices in a GT string, preserving phase.
-fn swap_gt(gt: &str) -> String {
-    let swap_allele = |tok: &str| -> String {
-        match tok {
-            "0" => "1".to_owned(),
-            "1" => "0".to_owned(),
-            other => other.to_owned(),
+/// Find the byte offset of the `n`-th tab (0-indexed) in `line`, or `None`.
+#[inline]
+fn nth_tab(line: &[u8], n: usize) -> Option<usize> {
+    let mut count = 0usize;
+    for (i, &b) in line.iter().enumerate() {
+        if b == b'\t' {
+            if count == n {
+                return Some(i);
+            }
+            count += 1;
+        }
+    }
+    None
+}
+
+/// Field `n` (0-indexed) of a tab-split line, as a byte slice.
+#[inline]
+fn field(line: &[u8], n: usize) -> &[u8] {
+    let start = if n == 0 {
+        0
+    } else {
+        match nth_tab(line, n - 1) {
+            Some(i) => i + 1,
+            None => return b"",
         }
     };
-    if let Some(pos) = gt.find('/') {
-        return format!(
-            "{}/{}",
-            swap_allele(&gt[..pos]),
-            swap_allele(&gt[pos + 1..])
-        );
-    }
-    if let Some(pos) = gt.find('|') {
-        return format!(
-            "{}|{}",
-            swap_allele(&gt[..pos]),
-            swap_allele(&gt[pos + 1..])
-        );
-    }
-    swap_allele(gt)
-}
-
-/// Rewrite a FORMAT/sample block, swapping allele 0↔1 in every sample GT.
-fn swap_gt_column(format_and_samples: &str) -> String {
-    let mut parts = format_and_samples.splitn(2, '\t');
-    let format_col = parts.next().unwrap_or(format_and_samples);
-    let Some(samples_str) = parts.next() else {
-        return format_and_samples.to_owned();
-    };
-
-    let gt_idx = format_col.split(':').position(|f| f == "GT");
-    let Some(gt_idx) = gt_idx else {
-        return format_and_samples.to_owned();
-    };
-
-    let new_samples: Vec<String> = samples_str
-        .split('\t')
-        .map(|sample| {
-            let fields: Vec<&str> = sample.split(':').collect();
-            if gt_idx < fields.len() {
-                let mut owned: Vec<String> = fields.iter().map(|s| (*s).to_owned()).collect();
-                owned[gt_idx] = swap_gt(fields[gt_idx]);
-                owned.join(":")
-            } else {
-                sample.to_owned()
+    let end = match nth_tab(line, n) {
+        Some(i) => i,
+        None => {
+            // Last field: strip trailing newline.
+            let e = line.len();
+            if e > 0 && (line[e - 1] == b'\n' || line[e - 1] == b'\r') {
+                let e = if e >= 2 && line[e - 2] == b'\r' {
+                    e - 2
+                } else {
+                    e - 1
+                };
+                return &line[start..e];
             }
-        })
-        .collect();
-
-    format!("{format_col}\t{}", new_samples.join("\t"))
-}
-
-/// Append a `FIXREF=<action>` annotation to the INFO field of an already-modified line.
-///
-/// If INFO is `.` it is replaced outright; otherwise the tag is appended with `;`.
-/// This matches bcftools +fixref behaviour (fixref.c `process()`).
-fn annotate_info(line: &str, action: &str) -> String {
-    // Split on tab to locate col[7] (INFO).
-    let cols: Vec<&str> = line.splitn(9, '\t').collect();
-    if cols.len() < 8 {
-        return line.to_owned();
-    }
-    let tag = format!("FIXREF={action}");
-    let new_info = if cols[7] == "." {
-        tag
-    } else {
-        format!("{};{tag}", cols[7])
+            return &line[start..e];
+        }
     };
-    let before_info = cols[..7].join("\t");
-    if cols.len() >= 9 {
-        format!("{before_info}\t{new_info}\t{}", cols[8])
+    &line[start..end]
+}
+
+/// Write GT-swapped FORMAT+samples (from the 9th column onward) to `w`.
+///
+/// Swaps allele 0↔1 in every sample's GT field. Operates on byte slices to
+/// avoid allocations.
+fn write_swapped_gt_column(fmt_samples: &[u8], w: &mut dyn Write) -> std::io::Result<()> {
+    // Find the GT field index within the FORMAT column.
+    let tab_pos = fmt_samples.iter().position(|&b| b == b'\t');
+    let format_col = match tab_pos {
+        Some(p) => &fmt_samples[..p],
+        None => fmt_samples,
+    };
+
+    let gt_idx = format_col.split(|&b| b == b':').position(|f| f == b"GT");
+
+    let Some(gt_idx) = gt_idx else {
+        // No GT field — pass through unchanged.
+        return w.write_all(fmt_samples);
+    };
+
+    let samples_start = match tab_pos {
+        Some(p) => p + 1,
+        None => return w.write_all(fmt_samples),
+    };
+
+    w.write_all(format_col)?;
+
+    let samples_bytes = &fmt_samples[samples_start..];
+    // Iterate samples (tab-separated).
+    for (si, sample) in samples_bytes.split(|&b| b == b'\t').enumerate() {
+        if si == 0 {
+            w.write_all(b"\t")?;
+        } else {
+            w.write_all(b"\t")?;
+        }
+        // Iterate FORMAT fields (colon-separated).
+        for (fi, fld) in sample.split(|&b| b == b':').enumerate() {
+            if fi > 0 {
+                w.write_all(b":")?;
+            }
+            if fi == gt_idx {
+                write_swapped_gt(fld, w)?;
+            } else {
+                w.write_all(fld)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write a GT token with alleles 0 and 1 swapped, preserving phase separators.
+#[inline]
+fn write_swapped_gt(gt: &[u8], w: &mut dyn Write) -> std::io::Result<()> {
+    let sep = if let Some(p) = gt.iter().position(|&b| b == b'/') {
+        Some((p, b'/'))
+    } else if let Some(p) = gt.iter().position(|&b| b == b'|') {
+        Some((p, b'|'))
     } else {
-        format!("{before_info}\t{new_info}")
+        None
+    };
+    if let Some((pos, sep_byte)) = sep {
+        write_swapped_allele(&gt[..pos], w)?;
+        w.write_all(&[sep_byte])?;
+        write_swapped_allele(&gt[pos + 1..], w)?;
+    } else {
+        write_swapped_allele(gt, w)?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn write_swapped_allele(tok: &[u8], w: &mut dyn Write) -> std::io::Result<()> {
+    match tok {
+        b"0" => w.write_all(b"1"),
+        b"1" => w.write_all(b"0"),
+        other => w.write_all(other),
     }
 }
 
-/// Classify and (in fix modes) rewrite a single VCF data line, updating `stats`.
+// ── Core per-line processor (zero-allocation hot path) ────────────────────────
+
+/// Process one VCF data line (as raw bytes, with newline stripped by caller).
 ///
-/// Returns `(modified_line, fixref_action)`.  `fixref_action` is `None` only in
-/// check mode (stats-only pass-through) or when the line is malformed.
-///
-/// `contig_cache` holds the sequence bytes for the contig currently loaded into
-/// memory.  The caller is responsible for populating it before calling this
-/// function whenever the CHROM column changes.
-fn process_line(
-    line: &str,
+/// Writes the (possibly modified) line to `w` followed by `\n`, updating
+/// `stats`. Returns the action string for FIXREF annotation (or `None` in
+/// check mode / error / malformed input).
+fn process_line_bytes(
+    line: &[u8],
     contig_cache: Option<&[u8]>,
     mode: FixMode,
     stats: &mut Stats,
-    skipped_chroms: &mut HashMap<String, bool>,
-) -> (String, Option<&'static str>) {
+    skipped_chroms: &mut HashMap<Vec<u8>, bool>,
+    annotate: bool,
+    w: &mut dyn Write,
+) -> std::io::Result<()> {
     stats.nsite += 1;
 
-    // VCF: CHROM POS ID REF ALT QUAL FILTER INFO [FORMAT samples…]
-    let mut cols: Vec<&str> = line.splitn(9, '\t').collect();
-    if cols.len() < 8 {
+    // Quick field count check: need at least 8 tab-separated fields.
+    let tab3 = nth_tab(line, 2); // after col2 (ID)
+    if tab3.is_none() {
         stats.nerr += 1;
-        return (line.to_owned(), None);
+        w.write_all(line)?;
+        w.write_all(b"\n")?;
+        return Ok(());
     }
 
-    let chrom = cols[0];
-    let pos_str = cols[1];
-    let ref_col = cols[3];
-    let alt_col = cols[4];
+    let ref_col = field(line, 3);
+    let alt_col = field(line, 4);
+    let info_col_start = nth_tab(line, 6).map(|i| i + 1);
 
-    if alt_col.contains(',') {
+    if info_col_start.is_none() {
+        stats.nerr += 1;
+        w.write_all(line)?;
+        w.write_all(b"\n")?;
+        return Ok(());
+    }
+
+    // Multi-allelic: pass through.
+    if memchr(b',', alt_col) {
         stats.non_biallelic += 1;
         stats.nskip += 1;
-        return (line.to_owned(), Some("skip"));
+        return write_line_annotated(line, b"skip", annotate, w);
     }
 
+    // Non-SNP: pass through.
     if ref_col.len() != 1 || alt_col.len() != 1 {
         stats.non_snp += 1;
         stats.nskip += 1;
-        return (line.to_owned(), Some("skip"));
+        return write_line_annotated(line, b"skip", annotate, w);
     }
 
-    let ia = nt2int(ref_col.as_bytes()[0]);
-    let ib = nt2int(alt_col.as_bytes()[0]);
+    let ia = nt2int(ref_col[0]);
+    let ib = nt2int(alt_col[0]);
 
     if ia == NON_ACGT || ib == NON_ACGT {
         stats.non_acgt += 1;
         stats.nskip += 1;
-        return (line.to_owned(), Some("skip"));
+        return write_line_annotated(line, b"skip", annotate, w);
     }
 
-    let pos1: u64 = if let Ok(v) = pos_str.parse() {
-        v
-    } else {
-        stats.nerr += 1;
-        return (line.to_owned(), None);
+    // Parse POS (field 1).
+    let pos_bytes = field(line, 1);
+    let pos1: u64 = match parse_u64(pos_bytes) {
+        Some(v) => v,
+        None => {
+            stats.nerr += 1;
+            w.write_all(line)?;
+            w.write_all(b"\n")?;
+            return Ok(());
+        }
     };
     let pos0 = pos1.saturating_sub(1);
 
-    // contig_cache is None when the contig is absent from the FASTA index.
+    // Look up reference base.
     let Some(ir) = contig_cache.and_then(|seq| base_from_cache(seq, pos0)) else {
+        let chrom = field(line, 0);
         if !skipped_chroms.contains_key(chrom) {
-            eprintln!("Ignoring sequence \"{chrom}\"");
-            skipped_chroms.insert(chrom.to_owned(), true);
+            let chrom_str = String::from_utf8_lossy(chrom);
+            eprintln!("Ignoring sequence \"{chrom_str}\"");
+            skipped_chroms.insert(chrom.to_vec(), true);
         }
         stats.nskip += 1;
-        // contig absent from FASTA — bcftools emits skip
-        return (line.to_owned(), Some("skip"));
+        return write_line_annotated(line, b"skip", annotate, w);
     };
 
     stats.count[ia as usize][ib as usize] += 1;
 
-    // In flip (not flip-all) mode, ambiguous pairs (A/T=0x9, C/G=0x6) are unresolvable
-    // without a dbSNP anchor to determine which strand is correct.
+    // In flip (not flip-all) mode skip ambiguous A/T and C/G pairs.
     if mode == FixMode::Flip {
         let pair = (1u8 << ia) | (1u8 << ib);
         if pair == 0x9 || pair == 0x6 {
             stats.nunresolved += 1;
-            return (line.to_owned(), Some("skip"));
+            return write_line_annotated(line, b"skip", annotate, w);
         }
     }
 
@@ -381,66 +434,144 @@ fn process_line(
         } else {
             stats.nerr += 1;
         }
-        return (line.to_owned(), None);
+        w.write_all(line)?;
+        w.write_all(b"\n")?;
+        return Ok(());
     }
 
     if ir == ia {
+        // No change needed.
         stats.nok += 1;
-        return (line.to_owned(), Some("none"));
+        return write_line_annotated(line, b"none", annotate, w);
     }
 
     if ir == ib {
-        // bcftools: FIX_SWAP|FIX_GT → "swap,GT"
+        // FIX_SWAP: swap REF and ALT, swap GT 0↔1.
         stats.nswap += 1;
-        cols[3] = alt_col;
-        cols[4] = ref_col;
-        if cols.len() >= 9 {
-            let new_fmt_samples = swap_gt_column(cols[8]);
-            return (rebuild_line(&cols, &new_fmt_samples), Some("swap,GT"));
-        }
-        return (cols.join("\t"), Some("swap,GT"));
+        return write_modified_line(line, alt_col[0], ref_col[0], true, b"swap,GT", annotate, w);
     }
 
     if ir == revint(ia) {
-        // bcftools: FIX_FLIP → "flip" (GT unchanged, only alleles complemented)
+        // FIX_FLIP: complement both alleles, keep GT.
         stats.nflip += 1;
-        let ref_s = String::from(char::from(int2nt(revint(ia))));
-        let alt_s = String::from(char::from(int2nt(revint(ib))));
-        cols[3] = &ref_s;
-        cols[4] = &alt_s;
-        return (cols.join("\t"), Some("flip"));
+        let new_ref = int2nt(revint(ia));
+        let new_alt = int2nt(revint(ib));
+        return write_modified_line(line, new_ref, new_alt, false, b"flip", annotate, w);
     }
 
     if ir == revint(ib) {
-        // bcftools: FIX_FLIP|FIX_SWAP|FIX_GT → "flip,swap,GT"
+        // FIX_FLIP|FIX_SWAP|FIX_GT: flip+swap REF/ALT, swap GT.
         stats.nflip_swap += 1;
-        let ref_s = String::from(char::from(int2nt(revint(ib))));
-        let alt_s = String::from(char::from(int2nt(revint(ia))));
-        cols[3] = &ref_s;
-        cols[4] = &alt_s;
-        if cols.len() >= 9 {
-            let new_fmt_samples = swap_gt_column(cols[8]);
-            return (rebuild_line(&cols, &new_fmt_samples), Some("flip,swap,GT"));
-        }
-        return (cols.join("\t"), Some("flip,swap,GT"));
+        let new_ref = int2nt(revint(ib));
+        let new_alt = int2nt(revint(ia));
+        return write_modified_line(line, new_ref, new_alt, true, b"flip,swap,GT", annotate, w);
     }
 
     stats.nerr += 1;
-    (line.to_owned(), Some("err"))
+    write_line_annotated(line, b"err", annotate, w)
 }
 
-/// Rebuild cols[0..8] joined by tabs, then append the new FORMAT+samples string.
-fn rebuild_line(cols: &[&str], new_fmt_samples: &str) -> String {
-    let mut out = String::with_capacity(512);
-    for (i, col) in cols.iter().take(8).enumerate() {
-        if i > 0 {
-            out.push('\t');
+/// Write a VCF line with modified REF (col3), ALT (col4), and optionally
+/// swapped GT, followed by FIXREF annotation if requested.
+fn write_modified_line(
+    line: &[u8],
+    new_ref: u8,
+    new_alt: u8,
+    swap_gt: bool,
+    action: &[u8],
+    annotate: bool,
+    w: &mut dyn Write,
+) -> std::io::Result<()> {
+    // Write fields 0..2 unchanged.
+    let t2 = nth_tab(line, 2).unwrap(); // col3 start
+    w.write_all(&line[..t2 + 1])?;
+    // Write new REF.
+    w.write_all(&[new_ref, b'\t'])?;
+    // Write new ALT.
+    w.write_all(&[new_alt, b'\t'])?;
+    // Write QUAL, FILTER (fields 5..6) unchanged.
+    let t4 = nth_tab(line, 4).unwrap();
+    let t6 = nth_tab(line, 6).unwrap();
+    w.write_all(&line[t4 + 1..t6 + 1])?;
+    // INFO field.
+    if annotate {
+        let info_start = t6 + 1;
+        let info_end = nth_tab(line, 7).unwrap_or(line.len());
+        let info = &line[info_start..info_end];
+        if info == b"." {
+            write!(w, "FIXREF={}", String::from_utf8_lossy(action))?;
+        } else {
+            w.write_all(info)?;
+            write!(w, ";FIXREF={}", String::from_utf8_lossy(action))?;
         }
-        out.push_str(col);
+    } else {
+        let info_start = t6 + 1;
+        let info_end = nth_tab(line, 7).unwrap_or(line.len());
+        w.write_all(&line[info_start..info_end])?;
     }
-    out.push('\t');
-    out.push_str(new_fmt_samples);
-    out
+    // FORMAT + samples (field 8+), possibly with swapped GT.
+    if let Some(t7) = nth_tab(line, 7) {
+        w.write_all(b"\t")?;
+        let fmt_samples = &line[t7 + 1..];
+        // Strip trailing newline from fmt_samples for processing.
+        let fmt_samples = trim_newline(fmt_samples);
+        if swap_gt {
+            write_swapped_gt_column(fmt_samples, w)?;
+        } else {
+            w.write_all(fmt_samples)?;
+        }
+    }
+    w.write_all(b"\n")
+}
+
+/// Write a VCF line pass-through (no REF/ALT changes).
+///
+/// Used for records we do not modify (skip, err, check mode, or the `none`
+/// action in flip mode where the REF already matches). FIXREF annotation is
+/// not emitted for these pass-through records; bcftools +fixref similarly does
+/// not tag them.
+fn write_line_annotated(
+    line: &[u8],
+    _action: &[u8],
+    _annotate: bool,
+    w: &mut dyn Write,
+) -> std::io::Result<()> {
+    w.write_all(line)?;
+    w.write_all(b"\n")
+}
+
+// ── Small helpers ─────────────────────────────────────────────────────────────
+
+#[inline]
+fn memchr(needle: u8, haystack: &[u8]) -> bool {
+    haystack.contains(&needle)
+}
+
+#[inline]
+fn parse_u64(s: &[u8]) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for &b in s {
+        if b < b'0' || b > b'9' {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(n)
+}
+
+#[inline]
+fn trim_newline(s: &[u8]) -> &[u8] {
+    let mut e = s.len();
+    if e > 0 && s[e - 1] == b'\n' {
+        e -= 1;
+    }
+    if e > 0 && s[e - 1] == b'\r' {
+        e -= 1;
+    }
+    &s[..e]
 }
 
 // ── Stats output ──────────────────────────────────────────────────────────────
@@ -517,7 +648,7 @@ fn print_stats(stats: &Stats) {
     eprintln!("NS\tnon-biallelic\t{}", stats.non_biallelic);
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
+// ── Public API ────────────────────────────────────────────────────────────────
 
 pub struct FixrefStats {
     pub total: u64,
@@ -540,7 +671,6 @@ pub fn fixref(
     output: &mut dyn Write,
     mode: FixMode,
 ) -> Result<FixrefStats> {
-    // Try "<base>.fa.fai" first, then "<base>.fai" fallback.
     let fai_path = {
         let ext = fasta_path
             .extension()
@@ -564,40 +694,39 @@ pub fn fixref(
         )));
     }
 
-    let index = load_fai(&fai_path)?;
+    let index: HashMap<Vec<u8>, FaiEntry> = load_fai(&fai_path)?;
     let mut fasta = File::open(fasta_path)
         .map_err(|e| RsomicsError::InvalidInput(format!("{}: {e}", fasta_path.display())))?;
     let vcf_file = File::open(vcf_path)
         .map_err(|e| RsomicsError::InvalidInput(format!("{}: {e}", vcf_path.display())))?;
 
-    let reader = BufReader::new(vcf_file);
+    let mut reader = BufReader::new(vcf_file);
     let mut writer = BufWriter::new(output);
     let mut stats = Stats::default();
-    let mut skipped_chroms: HashMap<String, bool> = HashMap::new();
+    let mut skipped_chroms: HashMap<Vec<u8>, bool> = HashMap::new();
+    let mut contig_cache: HashMap<Vec<u8>, Option<Arc<Vec<u8>>>> = HashMap::new();
 
-    // Contig cache: load each chromosome's sequence once on first encounter,
-    // regardless of record ordering. After the first lookup the HashMap hit is
-    // O(1) with no file I/O — eliminates all per-record seek syscalls.
-    let mut contig_cache: HashMap<String, Option<Arc<Vec<u8>>>> = HashMap::new();
-
-    // Whether FIXREF annotations are emitted (check/stats mode is pass-through only).
     let annotate = mode != FixMode::Check;
-    let fixref_info_header = r#"##INFO=<ID=FIXREF,Number=.,Type=String,Description="The change made by bcftools/fixref">"#;
+    let fixref_info_header = b"##INFO=<ID=FIXREF,Number=.,Type=String,Description=\"The change made by bcftools/fixref\">\n";
 
-    for raw in reader.lines() {
-        let line = raw.map_err(RsomicsError::Io)?;
-        if line.starts_with('#') {
-            // Inject the ##INFO=<ID=FIXREF,...> header immediately before the
-            // #CHROM column-header line, matching bcftools output ordering.
-            if annotate && line.starts_with("#CHROM") {
+    let mut buf = Vec::with_capacity(4096);
+    loop {
+        buf.clear();
+        let n = reader
+            .read_until(b'\n', &mut buf)
+            .map_err(RsomicsError::Io)?;
+        if n == 0 {
+            break;
+        }
+        let line = trim_newline(&buf);
+
+        if line.starts_with(b"#") {
+            if annotate && line.starts_with(b"#CHROM") {
                 writer
-                    .write_all(fixref_info_header.as_bytes())
+                    .write_all(fixref_info_header)
                     .map_err(RsomicsError::Io)?;
-                writer.write_all(b"\n").map_err(RsomicsError::Io)?;
             }
-            writer
-                .write_all(line.as_bytes())
-                .map_err(RsomicsError::Io)?;
+            writer.write_all(line).map_err(RsomicsError::Io)?;
             writer.write_all(b"\n").map_err(RsomicsError::Io)?;
             continue;
         }
@@ -605,32 +734,22 @@ pub fn fixref(
             continue;
         }
 
-        // Extract CHROM (first tab-delimited field) and resolve its cached bytes.
-        let chrom = line.split('\t').next().unwrap_or("");
+        // Extract CHROM and resolve its cached contig.
+        let chrom = field(line, 0);
         let contig_seq = contig_cache
-            .entry(chrom.to_owned())
+            .entry(chrom.to_vec())
             .or_insert_with(|| index.get(chrom).and_then(|e| load_contig(&mut fasta, e)));
 
-        let (out_line, action) = process_line(
-            &line,
+        process_line_bytes(
+            line,
             contig_seq.as_deref().map(Vec::as_slice),
             mode,
             &mut stats,
             &mut skipped_chroms,
-        );
-        let final_line = if annotate {
-            if let Some(act) = action {
-                annotate_info(&out_line, act)
-            } else {
-                out_line
-            }
-        } else {
-            out_line
-        };
-        writer
-            .write_all(final_line.as_bytes())
-            .map_err(RsomicsError::Io)?;
-        writer.write_all(b"\n").map_err(RsomicsError::Io)?;
+            annotate,
+            &mut writer,
+        )
+        .map_err(RsomicsError::Io)?;
     }
 
     writer.flush().map_err(RsomicsError::Io)?;
