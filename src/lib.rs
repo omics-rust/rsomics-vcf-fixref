@@ -471,7 +471,11 @@ fn process_line_bytes(
     // In flip mode bcftools emits FIXREF=skip for unresolvable records; in
     // flip-all mode it emits FIXREF=err (no ambiguous-pair short-circuit in
     // that branch means errors reach a distinct code path).
-    let err_tag = if mode == FixMode::Flip { b"skip" as &[u8] } else { b"err" };
+    let err_tag = if mode == FixMode::Flip {
+        b"skip" as &[u8]
+    } else {
+        b"err"
+    };
     write_line_annotated(line, err_tag, annotate, w)
 }
 
