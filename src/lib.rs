@@ -275,12 +275,8 @@ fn write_swapped_gt_column(fmt_samples: &[u8], w: &mut dyn Write) -> std::io::Re
 
     let samples_bytes = &fmt_samples[samples_start..];
     // Iterate samples (tab-separated).
-    for (si, sample) in samples_bytes.split(|&b| b == b'\t').enumerate() {
-        if si == 0 {
-            w.write_all(b"\t")?;
-        } else {
-            w.write_all(b"\t")?;
-        }
+    for sample in samples_bytes.split(|&b| b == b'\t') {
+        w.write_all(b"\t")?;
         // Iterate FORMAT fields (colon-separated).
         for (fi, fld) in sample.split(|&b| b == b':').enumerate() {
             if fi > 0 {
@@ -299,13 +295,11 @@ fn write_swapped_gt_column(fmt_samples: &[u8], w: &mut dyn Write) -> std::io::Re
 /// Write a GT token with alleles 0 and 1 swapped, preserving phase separators.
 #[inline]
 fn write_swapped_gt(gt: &[u8], w: &mut dyn Write) -> std::io::Result<()> {
-    let sep = if let Some(p) = gt.iter().position(|&b| b == b'/') {
-        Some((p, b'/'))
-    } else if let Some(p) = gt.iter().position(|&b| b == b'|') {
-        Some((p, b'|'))
-    } else {
-        None
-    };
+    let sep = gt
+        .iter()
+        .position(|&b| b == b'/')
+        .map(|p| (p, b'/'))
+        .or_else(|| gt.iter().position(|&b| b == b'|').map(|p| (p, b'|')));
     if let Some((pos, sep_byte)) = sep {
         write_swapped_allele(&gt[..pos], w)?;
         w.write_all(&[sep_byte])?;
@@ -594,7 +588,7 @@ fn parse_u64(s: &[u8]) -> Option<u64> {
     }
     let mut n: u64 = 0;
     for &b in s {
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             return None;
         }
         n = n.checked_mul(10)?.checked_add((b - b'0') as u64)?;
