@@ -468,7 +468,11 @@ fn process_line_bytes(
     }
 
     stats.nerr += 1;
-    write_line_annotated(line, b"err", annotate, w)
+    // In flip mode bcftools emits FIXREF=skip for unresolvable records; in
+    // flip-all mode it emits FIXREF=err (no ambiguous-pair short-circuit in
+    // that branch means errors reach a distinct code path).
+    let err_tag = if mode == FixMode::Flip { b"skip" as &[u8] } else { b"err" };
+    write_line_annotated(line, err_tag, annotate, w)
 }
 
 /// Write a VCF line with modified REF (col3), ALT (col4), and optionally
@@ -524,19 +528,51 @@ fn write_modified_line(
     w.write_all(b"\n")
 }
 
-/// Write a VCF line pass-through (no REF/ALT changes).
+/// Write a VCF line pass-through, optionally appending a `FIXREF=<action>` tag
+/// to the INFO field.
 ///
-/// Used for records we do not modify (skip, err, check mode, or the `none`
-/// action in flip mode where the REF already matches). FIXREF annotation is
-/// not emitted for these pass-through records; bcftools +fixref similarly does
-/// not tag them.
+/// Called for records where REF and ALT bytes do not change: `none` (REF already
+/// matches FASTA), `skip` (multi-allelic / non-SNP / non-ACGT), and `err`
+/// (unresolvable allele mismatch). In check mode, `annotate` is false and the
+/// line is emitted verbatim. In flip/flip-all mode, `annotate` is true and
+/// `FIXREF=<action>` is appended to INFO — matching bcftools +fixref behaviour.
 fn write_line_annotated(
     line: &[u8],
-    _action: &[u8],
-    _annotate: bool,
+    action: &[u8],
+    annotate: bool,
     w: &mut dyn Write,
 ) -> std::io::Result<()> {
-    w.write_all(line)?;
+    if !annotate {
+        w.write_all(line)?;
+        w.write_all(b"\n")?;
+        return Ok(());
+    }
+    // Annotate: patch INFO field in-place, keeping all other fields unchanged.
+    // Fields 0..6 (CHROM..FILTER) and 8+ (FORMAT+samples) are written verbatim.
+    let t6 = match nth_tab(line, 6) {
+        Some(i) => i,
+        None => {
+            // Malformed record: fewer than 7 fields. Emit as-is.
+            w.write_all(line)?;
+            w.write_all(b"\n")?;
+            return Ok(());
+        }
+    };
+    let info_start = t6 + 1;
+    let info_end = nth_tab(line, 7).unwrap_or(line.len());
+    let info = &line[info_start..info_end];
+
+    w.write_all(&line[..info_start])?;
+    if info == b"." {
+        write!(w, "FIXREF={}", String::from_utf8_lossy(action))?;
+    } else {
+        w.write_all(info)?;
+        write!(w, ";FIXREF={}", String::from_utf8_lossy(action))?;
+    }
+    // Remaining fields (FORMAT + samples) if present.
+    if info_end < line.len() {
+        w.write_all(&line[info_end..])?;
+    }
     w.write_all(b"\n")
 }
 
