@@ -12,6 +12,11 @@ description = "Check/fix VCF REF allele and strand against a reference FASTA —
 name = "rsomics-vcf-fixref"
 path = "src/main.rs"
 
+
+[lib]
+name = "rsomics_vcf_fixref"
+path = "src/lib.rs"
+doctest = false
 [dependencies]
 rsomics-common = { version = "0.6" }
 rsomics-help = { version = "0.3" }
