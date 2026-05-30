@@ -79,4 +79,3 @@ pub(crate) fn load_contig(fasta: &mut File, entry: &FaiEntry) -> Option<Arc<Vec<
     bases.truncate(entry.length as usize);
     Some(Arc::new(bases))
 }
-
